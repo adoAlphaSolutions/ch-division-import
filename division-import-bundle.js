@@ -89,22 +89,53 @@ async function parseFile(file) {
   }).filter(r => r.ProductId || r.DivisionsCodes);
 }
 
-// Set a property whether or not it is localized: try plain, fall back to culture.
+// Create a local entity. Some Content Hub SDK versions accept only the
+// definition name; others require a culture / load option as a 2nd argument
+// (and internally call .toString() on it — passing nothing yields the
+// "reading 'toString' of undefined" error). Try the variants in order.
+async function createEntity(client, definitionName, culture) {
+  const attempts = [
+    () => client.entityFactory.createAsync(definitionName),
+    () => client.entityFactory.createAsync(definitionName, culture),
+    () => client.entityFactory.createAsync(definitionName, [culture])
+  ];
+  let lastErr;
+  for (const attempt of attempts) {
+    try {
+      const entity = await attempt();
+      if (entity) return entity;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw new Error(`entityFactory.createAsync failed: ${lastErr && lastErr.message ? lastErr.message : lastErr}`);
+}
+
+// Set a property whether or not it is localized: try plain, then with culture.
 function setProp(entity, name, value, culture) {
   try {
     entity.setPropertyValue(name, value);
-  } catch (e) {
-    entity.setPropertyValue(name, value, culture);
+  } catch (e1) {
+    try {
+      entity.setPropertyValue(name, value, culture);
+    } catch (e2) {
+      throw new Error(`setPropertyValue('${name}') failed: ${e1 && e1.message ? e1.message : e1} | ${e2 && e2.message ? e2.message : e2}`);
+    }
   }
 }
 
 // Create one staging entity via the authenticated SDK client.
 async function createStagingRow(client, definitionName, productId, codes, patternCodes, culture) {
-  const entity = await client.entityFactory.createAsync(definitionName);
+  const entity = await createEntity(client, definitionName, culture);
   setProp(entity, 'ProductId', String(productId), culture);
   setProp(entity, 'DivisionsCodes', String(codes || ''), culture);
   setProp(entity, 'PatternCodes', String(patternCodes || ''), culture);
-  const saved = await client.entities.saveAsync(entity);
+  let saved;
+  try {
+    saved = await client.entities.saveAsync(entity);
+  } catch (e) {
+    throw new Error(`saveAsync failed: ${e && e.message ? e.message : e}`);
+  }
   return (saved && (saved.id || saved.Id)) || entity.id || '(created)';
 }
 
@@ -114,7 +145,7 @@ export default function createExternalRoot(rootElement) {
     render(context) {
       const client = context && context.client;
       const cfg = (context && context.config) || {};
-      const culture = (context && context.culture) || 'en-US';
+      const culture = (context && (context.culture || (context.options && context.options.culture))) || 'en-US';
       const definitionName = cfg.definitionName || 'TB.PCM.DivisionTempImport';
 
       const style = document.createElement('style');
