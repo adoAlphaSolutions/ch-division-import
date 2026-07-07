@@ -20,7 +20,15 @@
 //
 // Spreadsheet columns (first worksheet):
 //   ProductId       -> the internal Content Hub id of the M.PCM.Product (e.g. 2880931)
-//   DivisionsCodes  -> comma-separated division codes (e.g. "AZ,CA,TX")
+//   DivisionsCodes  -> comma-separated division codes (e.g. "AZ,CA,TX").
+//                      Non-empty = ADD those divisions. Empty = REMOVE the pattern.
+//
+// The bundle derives the PATTERN = the union of all non-empty DivisionsCodes cells
+// in the file, and stamps it onto the PatternCodes field of EVERY staging row, so a
+// per-row action-script can tell an empty row what to remove.
+//
+// Requires these fields on TB.PCM.DivisionTempImport:
+//   ProductId (String), DivisionsCodes (String), PatternCodes (String)
 //
 // Configuration textarea (JSON), optional:
 //   { "definitionName": "TB.PCM.DivisionTempImport" }
@@ -91,10 +99,11 @@ function setProp(entity, name, value, culture) {
 }
 
 // Create one staging entity via the authenticated SDK client.
-async function createStagingRow(client, definitionName, productId, codes, culture) {
+async function createStagingRow(client, definitionName, productId, codes, patternCodes, culture) {
   const entity = await client.entityFactory.createAsync(definitionName);
   setProp(entity, 'ProductId', String(productId), culture);
-  setProp(entity, 'DivisionsCodes', String(codes), culture);
+  setProp(entity, 'DivisionsCodes', String(codes || ''), culture);
+  setProp(entity, 'PatternCodes', String(patternCodes || ''), culture);
   const saved = await client.entities.saveAsync(entity);
   return (saved && (saved.id || saved.Id)) || entity.id || '(created)';
 }
@@ -127,7 +136,8 @@ export default function createExternalRoot(rootElement) {
         </div>
         <div class="di-log" id="di-log"></div>
         <div style="font-size:12px;color:#888;margin-top:10px">
-          Columns: <b>ProductId</b> (Content Hub id), <b>DivisionsCodes</b> (comma-separated, e.g. AZ,CA,TX)
+          Columns: <b>ProductId</b> (CH id), <b>DivisionsCodes</b> (comma-separated = add; empty = remove the pattern).
+          The pattern is auto-detected and written to <b>PatternCodes</b> on every row.
         </div>
       `;
 
@@ -189,19 +199,34 @@ export default function createExternalRoot(rootElement) {
           return;
         }
 
+        // Pattern = union of all non-empty DivisionsCodes cells in the file.
+        const patternSet = new Set();
+        for (const r of rows) {
+          if (r.DivisionsCodes) {
+            r.DivisionsCodes.split(',').map(c => c.trim()).filter(Boolean).forEach(c => patternSet.add(c));
+          }
+        }
+        const patternCodes = Array.from(patternSet).join(',');
+        log(`Pattern detected: ${patternCodes || '(none)'}`, 'di-info');
+        if (!patternCodes) {
+          log('⚠ No non-empty DivisionsCodes in the file — empty rows will have nothing to remove.', 'di-err');
+        }
+
         let created = 0, errors = 0;
         for (let i = 0; i < rows.length; i++) {
           const r = rows[i];
-          const label = `Row ${i + 1}: ProductId="${r.ProductId}" Divisions="${r.DivisionsCodes}"`;
+          const op = r.DivisionsCodes ? 'ADD' : 'REMOVE';
+          const shown = op === 'ADD' ? r.DivisionsCodes : patternCodes;
+          const label = `Row ${i + 1}: ProductId="${r.ProductId}" [${op} ${shown}]`;
           try {
-            if (!r.ProductId || !r.DivisionsCodes) {
-              log(`${label} — missing ProductId or DivisionsCodes. Skipped.`, 'di-err');
+            if (!r.ProductId) {
+              log(`${label} — missing ProductId. Skipped.`, 'di-err');
               errors++; continue;
             }
             if (dryRun) {
-              log(`${label} → would create ${definitionName}`, 'di-skip');
+              log(`${label} → would create ${definitionName} (PatternCodes="${patternCodes}")`, 'di-skip');
             } else {
-              const id = await createStagingRow(client, definitionName, r.ProductId, r.DivisionsCodes, culture);
+              const id = await createStagingRow(client, definitionName, r.ProductId, r.DivisionsCodes, patternCodes, culture);
               log(`${label} → created ✓ (id ${id})`, 'di-ok');
               created++;
             }
