@@ -111,6 +111,23 @@ async function createEntity(client, definitionName, culture) {
   throw new Error(`entityFactory.createAsync failed: ${lastErr && lastErr.message ? lastErr.message : lastErr}`);
 }
 
+// Best-effort enumeration of the property names actually present on an entity,
+// so we can see whether e.g. "PatternCodes" exists and its exact casing.
+function listPropNames(entity) {
+  try {
+    const p = entity && entity.properties;
+    if (Array.isArray(p)) return p.map(x => x.name || x.Name).filter(Boolean).join(', ');
+    if (p && typeof p === 'object') return Object.keys(p).join(', ');
+    if (entity && typeof entity.getProperties === 'function') {
+      const arr = entity.getProperties();
+      if (Array.isArray(arr)) return arr.map(x => x.name || x.Name).filter(Boolean).join(', ');
+    }
+  } catch (e) {
+    return `(could not list: ${e && e.message ? e.message : e})`;
+  }
+  return '(unknown)';
+}
+
 // Set a property whether or not it is localized: try plain, then with culture.
 function setProp(entity, name, value, culture) {
   try {
@@ -127,9 +144,13 @@ function setProp(entity, name, value, culture) {
 // Create one staging entity via the authenticated SDK client.
 async function createStagingRow(client, definitionName, productId, codes, patternCodes, culture) {
   const entity = await createEntity(client, definitionName, culture);
-  setProp(entity, 'ProductId', String(productId), culture);
-  setProp(entity, 'DivisionsCodes', String(codes || ''), culture);
-  setProp(entity, 'PatternCodes', String(patternCodes || ''), culture);
+  try {
+    setProp(entity, 'ProductId', String(productId), culture);
+    setProp(entity, 'DivisionsCodes', String(codes || ''), culture);
+    setProp(entity, 'PatternCodes', String(patternCodes || ''), culture);
+  } catch (e) {
+    throw new Error(`${e && e.message ? e.message : e}. Entity properties present: [${listPropNames(entity)}]`);
+  }
   let saved;
   try {
     saved = await client.entities.saveAsync(entity);
