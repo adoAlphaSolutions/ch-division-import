@@ -35,6 +35,7 @@
 // ============================================================================
 
 const SHEETJS_URL = 'https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js';
+const CH_HOST = window.location.origin;
 
 const CSS = `
   .di-wrap   { font-family: "Segoe UI", sans-serif; padding: 24px; max-width: 780px; }
@@ -48,6 +49,8 @@ const CSS = `
   .di-btn:disabled { opacity: .5; cursor: not-allowed; }
   .di-dry    { background: #edf2f7; color: #2d3748; }
   .di-go     { background: #2b6cb0; color: #fff; }
+  .di-purge  { background: #c53030; color: #fff; }
+  .di-results{ background: #2f855a; color: #fff; }
   .di-log    { background: #1a202c; color: #e2e8f0; font-family: monospace; font-size: 12px;
                padding: 14px; border-radius: 6px; margin-top: 14px; max-height: 320px;
                overflow: auto; white-space: pre-wrap; display: none; }
@@ -142,12 +145,13 @@ function setProp(entity, name, value, culture) {
 }
 
 // Create one staging entity via the authenticated SDK client.
-async function createStagingRow(client, definitionName, productId, codes, patternCodes, culture) {
+async function createStagingRow(client, definitionName, productId, codes, patternCodes, fileName, culture) {
   const entity = await createEntity(client, definitionName, culture);
   try {
     setProp(entity, 'ProductId', String(productId), culture);
     setProp(entity, 'DivisionsCodes', String(codes || ''), culture);
     setProp(entity, 'PatternCodes', String(patternCodes || ''), culture);
+    setProp(entity, 'FileName', String(fileName || ''), culture);
   } catch (e) {
     throw new Error(`${e && e.message ? e.message : e}. Entity properties present: [${listPropNames(entity)}]`);
   }
@@ -158,6 +162,97 @@ async function createStagingRow(client, definitionName, productId, codes, patter
     throw new Error(`saveAsync failed: ${e && e.message ? e.message : e}`);
   }
   return (saved && (saved.id || saved.Id)) || entity.id || '(created)';
+}
+
+// Delete all staging rows whose Status == "Done". Found via the REST query
+// endpoint (uses the logged-in session), each deleted via the SDK client.
+// Deletes in pages and re-queries until none remain.
+async function purgeDone(client, definitionName, log) {
+  const chql = `Definition.Name=='${definitionName}' and Status=='Done'`;
+  let totalDeleted = 0;
+  let safety = 0;
+  while (safety++ < 200) {
+    const url = `${CH_HOST}/api/entities/query?query=${encodeURIComponent(chql)}&take=100`;
+    const res = await fetch(url, { credentials: 'include', headers: { Accept: 'application/json' } });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`query failed: HTTP ${res.status}${body ? ' — ' + body : ''}`);
+    }
+    const data = await res.json();
+    const items = (data && data.items) || [];
+    if (items.length === 0) break;
+
+    let deletedThisPage = 0;
+    for (const it of items) {
+      const id = it.id != null
+        ? it.id
+        : (it.self && it.self.href ? Number(it.self.href.split('/').pop()) : null);
+      if (id == null) continue;
+      try {
+        await client.entities.deleteAsync(id);
+        totalDeleted++;
+        deletedThisPage++;
+        log(`Deleted row id ${id}`, 'di-skip');
+      } catch (e) {
+        log(`Could not delete row id ${id}: ${e && e.message ? e.message : e}`, 'di-err');
+      }
+    }
+    // If nothing on this page could be deleted, stop to avoid an infinite loop.
+    if (deletedThisPage === 0) break;
+  }
+  return totalDeleted;
+}
+
+// Read a property value off a REST entity resource (plain or culture-keyed).
+function readProp(item, name) {
+  const p = item && item.properties ? item.properties[name] : undefined;
+  if (p == null) return '';
+  if (typeof p === 'object') {
+    const keys = Object.keys(p);
+    return keys.length ? String(p[keys[0]]) : '';
+  }
+  return String(p);
+}
+
+// Query staging rows (optionally for one file) and summarize their Status.
+async function showResults(definitionName, fileName, log) {
+  let chql = `Definition.Name=='${definitionName}'`;
+  if (fileName) {
+    chql += ` and FileName=='${fileName.replace(/'/g, "''")}'`;
+  }
+  let total = 0, done = 0, error = 0, pending = 0, safety = 0, skip = 0;
+  const errorRows = [];
+  while (safety++ < 200) {
+    const url = `${CH_HOST}/api/entities/query?query=${encodeURIComponent(chql)}` +
+                `&members=ProductId,Status,Observations,FileName&skip=${skip}&take=100`;
+    const res = await fetch(url, { credentials: 'include', headers: { Accept: 'application/json' } });
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`query failed: HTTP ${res.status}${body ? ' — ' + body : ''}`);
+    }
+    const data = await res.json();
+    const items = (data && data.items) || [];
+    if (items.length === 0) break;
+    for (const it of items) {
+      total++;
+      const st = readProp(it, 'Status');
+      if (st === 'Done') { done++; }
+      else if (st === 'Error') { error++; errorRows.push({ product: readProp(it, 'ProductId'), obs: readProp(it, 'Observations') }); }
+      else { pending++; }
+    }
+    if (items.length < 100) break;
+    skip += 100;
+  }
+
+  log(`── RESULTS${fileName ? ' for "' + fileName + '"' : ''} ──`, 'di-info');
+  log(`Total ${total} — ✓ ${done} Done · ✗ ${error} Error · … ${pending} Pending`, error ? 'di-err' : 'di-ok');
+  for (const er of errorRows) {
+    log(`  ✗ Product ${er.product}: ${er.obs || '(no observation)'}`, 'di-err');
+  }
+  if (pending > 0) {
+    log(`  ${pending} row(s) still Pending — the script runs in the background; click again in a moment.`, 'di-skip');
+  }
+  return { total, done, error, pending };
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +281,13 @@ export default function createExternalRoot(rootElement) {
           <button class="di-btn di-go"  id="di-go"  disabled>⬆ Create staging rows</button>
           <span id="di-status" style="font-size:13px;color:#555"></span>
         </div>
+        <div class="di-row">
+          <button class="di-btn di-results" id="di-results">📊 Show results</button>
+          <button class="di-btn di-purge" id="di-purge">🗑 Delete processed (Done) rows</button>
+        </div>
+        <div style="font-size:12px;color:#888;margin-bottom:6px">
+          Show results = Status summary for the last imported file. Delete = removes rows with Status = Done.
+        </div>
         <div class="di-log" id="di-log"></div>
         <div style="font-size:12px;color:#888;margin-top:10px">
           Columns: <b>ProductId</b> (CH id), <b>DivisionsCodes</b> (comma-separated = add; empty = remove the pattern).
@@ -201,10 +303,13 @@ export default function createExternalRoot(rootElement) {
       const input  = wrap.querySelector('#di-file');
       const dryBtn = wrap.querySelector('#di-dry');
       const goBtn  = wrap.querySelector('#di-go');
+      const purgeBtn = wrap.querySelector('#di-purge');
+      const resultsBtn = wrap.querySelector('#di-results');
       const status = wrap.querySelector('#di-status');
       const logEl  = wrap.querySelector('#di-log');
 
       let rows = [];
+      let currentFileName = '';
 
       function log(msg, cls) {
         logEl.style.display = 'block';
@@ -222,6 +327,7 @@ export default function createExternalRoot(rootElement) {
         status.textContent = 'Parsing…';
         try {
           rows = await parseFile(file);
+          currentFileName = file.name;
           status.textContent = `${file.name} — ${rows.length} row(s) ready`;
           dryBtn.disabled = rows.length === 0;
           goBtn.disabled = rows.length === 0;
@@ -278,7 +384,7 @@ export default function createExternalRoot(rootElement) {
             if (dryRun) {
               log(`${label} → would create ${definitionName} (PatternCodes="${patternCodes}")`, 'di-skip');
             } else {
-              const id = await createStagingRow(client, definitionName, r.ProductId, r.DivisionsCodes, patternCodes, culture);
+              const id = await createStagingRow(client, definitionName, r.ProductId, r.DivisionsCodes, patternCodes, currentFileName, culture);
               log(`${label} → created ✓ (id ${id})`, 'di-ok');
               created++;
             }
@@ -299,6 +405,34 @@ export default function createExternalRoot(rootElement) {
 
       dryBtn.addEventListener('click', () => run(true));
       goBtn.addEventListener('click', () => run(false));
+
+      resultsBtn.addEventListener('click', async () => {
+        clearLog();
+        resultsBtn.disabled = true;
+        try {
+          await showResults(definitionName, currentFileName, log);
+        } catch (e) {
+          log(`✗ Could not load results: ${e && e.message ? e.message : e}`, 'di-err');
+        }
+        resultsBtn.disabled = false;
+      });
+
+      purgeBtn.addEventListener('click', async () => {
+        clearLog();
+        if (!client) {
+          log('✗ No SDK client in context — open this inside Content Hub.', 'di-err');
+          return;
+        }
+        purgeBtn.disabled = true;
+        log('── DELETING DONE ROWS ──', 'di-info');
+        try {
+          const n = await purgeDone(client, definitionName, log);
+          log(`Done — deleted ${n} row(s) with Status=Done.`, n ? 'di-ok' : 'di-skip');
+        } catch (e) {
+          log(`✗ Purge failed: ${e && e.message ? e.message : e}`, 'di-err');
+        }
+        purgeBtn.disabled = false;
+      });
     },
 
     unmount() {
