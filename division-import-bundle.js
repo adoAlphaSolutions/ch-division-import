@@ -167,42 +167,6 @@ async function createStagingRow(client, definitionName, productId, codes, patter
 // Delete all staging rows whose Status == "Done". Found via the REST query
 // endpoint (uses the logged-in session), each deleted via the SDK client.
 // Deletes in pages and re-queries until none remain.
-async function purgeDone(client, definitionName, log) {
-  const chql = `${definitionName}.Status=='Done'`;
-  let totalDeleted = 0;
-  let safety = 0;
-  while (safety++ < 200) {
-    const url = `${CH_HOST}/api/entities/query?query=${encodeURIComponent(chql)}&take=100`;
-    const res = await fetch(url, { credentials: 'include', headers: { Accept: 'application/json' } });
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error(`query failed: HTTP ${res.status}${body ? ' — ' + body : ''}`);
-    }
-    const data = await res.json();
-    const items = (data && data.items) || [];
-    if (items.length === 0) break;
-
-    let deletedThisPage = 0;
-    for (const it of items) {
-      const id = it.id != null
-        ? it.id
-        : (it.self && it.self.href ? Number(it.self.href.split('/').pop()) : null);
-      if (id == null) continue;
-      try {
-        await client.entities.deleteAsync(id);
-        totalDeleted++;
-        deletedThisPage++;
-        log(`Deleted row id ${id}`, 'di-skip');
-      } catch (e) {
-        log(`Could not delete row id ${id}: ${e && e.message ? e.message : e}`, 'di-err');
-      }
-    }
-    // If nothing on this page could be deleted, stop to avoid an infinite loop.
-    if (deletedThisPage === 0) break;
-  }
-  return totalDeleted;
-}
-
 // Read a property value off a REST entity resource (plain or culture-keyed).
 function readProp(item, name) {
   const p = item && item.properties ? item.properties[name] : undefined;
@@ -214,14 +178,20 @@ function readProp(item, name) {
   return String(p);
 }
 
-// Query staging rows (optionally for one file) and summarize their Status.
-async function showResults(definitionName, fileName, log) {
-  let chql = fileName
-    ? `${definitionName}.FileName=='${fileName.replace(/'/g, "''")}'`
-    : `Definition.Name=='${definitionName}'`;
-  let total = 0, done = 0, error = 0, pending = 0, safety = 0, skip = 0;
-  const errorRows = [];
-  while (safety++ < 200) {
+function itemId(it) {
+  if (it && it.id != null) return it.id;
+  if (it && it.self && it.self.href) return Number(it.self.href.split('/').pop());
+  return null;
+}
+
+// Page through every row of the staging definition. Only the confirmed-valid
+// "Definition.Name==" expression is used; FileName/Status filtering happens in
+// JS afterwards, which avoids the finicky property-level query syntax.
+async function queryAllRows(definitionName) {
+  const chql = `Definition.Name=='${definitionName}'`;
+  const all = [];
+  let skip = 0, safety = 0;
+  while (safety++ < 1000) {
     const url = `${CH_HOST}/api/entities/query?query=${encodeURIComponent(chql)}` +
                 `&members=ProductId,Status,Observations,FileName&skip=${skip}&take=100`;
     const res = await fetch(url, { credentials: 'include', headers: { Accept: 'application/json' } });
@@ -232,15 +202,48 @@ async function showResults(definitionName, fileName, log) {
     const data = await res.json();
     const items = (data && data.items) || [];
     if (items.length === 0) break;
-    for (const it of items) {
-      total++;
-      const st = readProp(it, 'Status');
-      if (st === 'Done') { done++; }
-      else if (st === 'Error') { error++; errorRows.push({ product: readProp(it, 'ProductId'), obs: readProp(it, 'Observations') }); }
-      else { pending++; }
-    }
+    for (const it of items) { all.push(it); }
     if (items.length < 100) break;
     skip += 100;
+  }
+  return all;
+}
+
+// Delete all staging rows whose Status == "Done" (scanned in JS).
+async function purgeDone(client, definitionName, log) {
+  const items = await queryAllRows(definitionName);
+  const doneIds = [];
+  for (const it of items) {
+    if (readProp(it, 'Status') === 'Done') {
+      const id = itemId(it);
+      if (id != null) { doneIds.push(id); }
+    }
+  }
+  let deleted = 0;
+  for (const id of doneIds) {
+    try {
+      await client.entities.deleteAsync(id);
+      deleted++;
+      log(`Deleted row id ${id}`, 'di-skip');
+    } catch (e) {
+      log(`Could not delete row id ${id}: ${e && e.message ? e.message : e}`, 'di-err');
+    }
+  }
+  return deleted;
+}
+
+// Summarize Status for the staging rows (optionally scoped to one file).
+async function showResults(definitionName, fileName, log) {
+  const items = await queryAllRows(definitionName);
+  let total = 0, done = 0, error = 0, pending = 0;
+  const errorRows = [];
+  for (const it of items) {
+    if (fileName && readProp(it, 'FileName') !== fileName) { continue; }
+    total++;
+    const st = readProp(it, 'Status');
+    if (st === 'Done') { done++; }
+    else if (st === 'Error') { error++; errorRows.push({ product: readProp(it, 'ProductId'), obs: readProp(it, 'Observations') }); }
+    else { pending++; }
   }
 
   log(`── RESULTS${fileName ? ' for "' + fileName + '"' : ''} ──`, 'di-info');
