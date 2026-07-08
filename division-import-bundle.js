@@ -168,7 +168,7 @@ async function createStagingRow(client, definitionName, productId, codes, patter
 // endpoint (uses the logged-in session), each deleted via the SDK client.
 // Deletes in pages and re-queries until none remain.
 async function purgeDone(client, definitionName, log) {
-  const chql = `Definition.Name=='${definitionName}' and Status=='Done'`;
+  const chql = `${definitionName}.Status=='Done'`;
   let totalDeleted = 0;
   let safety = 0;
   while (safety++ < 200) {
@@ -216,10 +216,9 @@ function readProp(item, name) {
 
 // Query staging rows (optionally for one file) and summarize their Status.
 async function showResults(definitionName, fileName, log) {
-  let chql = `Definition.Name=='${definitionName}'`;
-  if (fileName) {
-    chql += ` and FileName=='${fileName.replace(/'/g, "''")}'`;
-  }
+  let chql = fileName
+    ? `${definitionName}.FileName=='${fileName.replace(/'/g, "''")}'`
+    : `Definition.Name=='${definitionName}'`;
   let total = 0, done = 0, error = 0, pending = 0, safety = 0, skip = 0;
   const errorRows = [];
   while (safety++ < 200) {
