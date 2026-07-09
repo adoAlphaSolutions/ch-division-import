@@ -280,15 +280,15 @@ export default function createExternalRoot(rootElement) {
         <input type="file" id="di-file" accept=".xlsx,.xls,.csv" style="display:none" />
         <div class="di-row">
           <button class="di-btn di-dry" id="di-dry" disabled>🔍 Dry Run</button>
-          <button class="di-btn di-go"  id="di-go"  disabled>⬆ Create staging rows</button>
+          <button class="di-btn di-go"  id="di-go"  disabled>⬆ Process file
           <span id="di-status" style="font-size:13px;color:#555"></span>
         </div>
         <div class="di-row">
           <button class="di-btn di-results" id="di-results">📊 Show results</button>
-          <button class="di-btn di-purge" id="di-purge">🗑 Delete processed (Done) rows</button>
+          <button class="di-btn di-purge" id="di-purge">🗑 Delete logs</button>
         </div>
         <div style="font-size:12px;color:#888;margin-bottom:6px">
-          Show results = Status summary for the last imported file. Delete = removes rows with Status = Done.
+          Show results = Status summary for the last imported file. Delete logs = removes rows with Status = Done.
         </div>
         <div class="di-log" id="di-log"></div>
         <div style="font-size:12px;color:#888;margin-top:10px">
